@@ -46,11 +46,6 @@ void screenBrightness(uint8_t value) {
     tft.setBrightness(value);
 }
 
-// Minimal stub for vibration function
-void vibratePin(bool state) {
-    // Do nothing for this minimal example
-}
-
 
 // --- Main Setup Function ---
 // --- Main Setup Function ---

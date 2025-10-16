@@ -33,7 +33,6 @@ extern "C" {
 
 void hal_setup(void);
 void hal_loop(void);
-void vibratePin(bool state);
 
 #ifdef __cplusplus
 } /* extern "C" */
