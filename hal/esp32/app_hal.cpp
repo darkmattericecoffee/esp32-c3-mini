@@ -1,77 +1,95 @@
 /**
- * @file esp32_slave.ino
+ * @file app_hal.cpp
  * @author Gemini
- * @brief ESP32 Slave Display Controller for Teensy Master
+ * @brief ESP32 Slave Display Controller for Teensy Master using LVGL.
  *
  * @details This code configures the ESP32 to act as a passive slave device.
- * It initializes an LVGL display and waits for commands from a Teensy master
- * over UART (Serial1). It does not initiate any communication itself, but simply
- * listens and updates the display based on the master's messages.
- *
- * Responsibilities:
- * - Initialize TFT display and LVGL.
- * - Display "Waiting for Teensy..." on startup.
- * - Listen for newline-terminated commands on Serial1.
- * - Process commands to:
- * - Display log/status messages ('L').
- * - Draw a G-code path ('T').
- * - Show the current toolhead position ('P').
- * - Reset the path ('R').
- * - Update connection status to "Connected" upon receiving the first message.
- * - If no message is received for a set timeout, update status to "Connection Lost!".
- * The connection is automatically re-established on the next message from the master.
+ * It initializes an LVGL display and waits for binary packet commands from a
+ * Teensy master over UART. It parses these packets to mirror the master's
+ * text display content.
  */
 
 #include "Arduino.h"
 #include <lvgl.h>
+#include <cstring> // For strncpy, strnlen
 #include "app_hal.h"
 #include "displays/pins.h"
 #include "displays/generic.hpp"
 
-// LVGL screen and buffer setup
+// --- LVGL & Display Setup ---
 static const uint32_t screenWidth = SCREEN_WIDTH;
 static const uint32_t screenHeight = SCREEN_HEIGHT;
-#define LV_BUFFER_SIZE (SCREEN_WIDTH * 20)
-static uint8_t lvBuffer[LV_BUFFER_SIZE * 2];
+// Use a macro to ensure the size is a compile-time constant, matching the user's example
+#define LV_BUFFER_SIZE (SCREEN_WIDTH * 10)
+static uint8_t lvBuffer[LV_BUFFER_SIZE];
+static uint8_t lvBuffer2[LV_BUFFER_SIZE];
+
 
 // LVGL UI Objects
-static lv_obj_t *status_label = nullptr;
 static lv_obj_t *connection_label = nullptr;
-static lv_obj_t *path_obj = nullptr; // To draw the G-code path
-static lv_obj_t *toolhead_obj = nullptr; // To represent the toolhead
+static lv_obj_t *main_text_label = nullptr;
 
-// Communication & State
-static bool handshakeComplete = false;
+// --- Communication Protocol Definition (must match Teensy's coms.h) ---
+constexpr uint8_t START_BYTE = 0xA5;
+
+enum class PacketType : uint8_t {
+    // Teensy -> ESP32 Commands
+    SYNC = 0x01,
+    HEARTBEAT = 0x05,
+    CLEAR_SCREEN = 0x11,
+    DRAW_TEXT = 0x12,
+    // ESP32 -> Teensy Responses
+    SYNC_ACK = 0x81,
+    ACK = 0x85
+};
+
+enum class Alignment : uint8_t {
+    CENTERED = 0,
+    TOP_LEFT = 1
+};
+
+#pragma pack(push, 1)
+struct DrawTextPayload {
+    uint8_t textSize;
+    Alignment alignment;
+    int16_t x;
+    int16_t y;
+    // Null-terminated string follows
+};
+#pragma pack(pop)
+
+// --- State Management ---
+static bool isConnected = false;
 static unsigned long lastPacketTime = 0;
-const unsigned long CONNECTION_TIMEOUT = 5000; // Timeout for receiving any message from master
+const unsigned long CONNECTION_TIMEOUT = 5000; // 5 seconds
 
-// Buffers
-#define TEXT_BUFFER_SIZE 512 // Increased to handle path segments
-static char textBuffer[TEXT_BUFFER_SIZE];
-static int textBufferIndex = 0;
+// --- UART Packet Parsing State Machine ---
+enum class ParseState {
+    WAIT_FOR_START, WAIT_FOR_TYPE, WAIT_FOR_LEN, READ_PAYLOAD, WAIT_FOR_CHECKSUM
+};
+static ParseState currentState = ParseState::WAIT_FOR_START;
+static uint8_t calculatedChecksum = 0;
+static PacketType receivedType;
+static uint8_t payloadLength = 0;
+static uint8_t payloadBuffer[256];
+static uint8_t payloadIndex = 0;
 
-// Path storage
-#define MAX_PATH_POINTS 10000 // Match Teensy's capacity
-static lv_point_precise_t path_points[MAX_PATH_POINTS];
-static int path_point_count = 0;
-
-// Forward declarations for LVGL
+// --- Forward Declarations ---
+// LVGL
 static uint32_t my_tick(void);
 void my_disp_flush(lv_display_t *display, const lv_area_t *area, unsigned char *data);
 static void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data);
 void screenBrightness(uint8_t value);
+// Communication
+void processIncomingUart();
+void handlePacket(PacketType type, const uint8_t* payload, uint8_t len);
+void sendResponse(PacketType type);
+// Drawing
+void drawTextFromPacket(const uint8_t* payload, uint8_t len);
+void updateConnectionStatus(const char* status, lv_color_t color);
 
-// Forward declarations for communication
-void sendResponse(const char* message);
-void updateConnectionStatus(const char* status, uint32_t color);
-void processMessage(const String& message);
-void handlePathMessage(const char* payload);
-void handlePositionMessage(const char* payload);
-void handleAngleMessage(const char* payload);
-void handleLogMessage(const char* payload);
-void handleResetMessage();
+// --- Main HAL Functions ---
 
-// HAL Setup - Initializes hardware and UI
 void hal_setup() {
     Serial.begin(115200);
     delay(500);
@@ -89,208 +107,192 @@ void hal_setup() {
     tft.fillScreen(TFT_BLACK);
     screenBrightness(150);
 
+    // Initialize LVGL
     lv_init();
     lv_tick_set_cb(my_tick);
 
+    // Create LVGL display
     static lv_display_t *lvDisplay = lv_display_create(screenWidth, screenHeight);
     lv_display_set_color_format(lvDisplay, LV_COLOR_FORMAT_RGB565);
     lv_display_set_flush_cb(lvDisplay, my_disp_flush);
-    lv_display_set_buffers(lvDisplay, lvBuffer, NULL, sizeof(lvBuffer), LV_DISPLAY_RENDER_MODE_PARTIAL);
+    lv_display_set_buffers(lvDisplay, lvBuffer, lvBuffer2, LV_BUFFER_SIZE, LV_DISPLAY_RENDER_MODE_PARTIAL);
+    
+    // Create LVGL input device (touch)
+    static lv_indev_t *lvInput = lv_indev_create();
+    lv_indev_set_type(lvInput, LV_INDEV_TYPE_POINTER);
+    lv_indev_set_read_cb(lvInput, my_touchpad_read);
 
-    // Basic UI Setup
-    lv_obj_t *bg = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(bg, screenWidth, screenHeight);
-    lv_obj_set_style_bg_color(bg, lv_color_black(), 0);
-    lv_obj_set_style_border_width(bg, 0, 0);
+    // Initialize and apply the theme, this sets the background color
+    lv_display_set_theme(lvDisplay, lv_theme_default_init(lvDisplay, lv_palette_main(LV_PALETTE_BLUE), lv_palette_main(LV_PALETTE_RED), 1, &lv_font_montserrat_14));
 
-    connection_label = lv_label_create(lv_screen_active());
+    // --- UI Setup for Mirrored Display ---
+    lv_obj_t *bg = lv_screen_active();
+
+    // 1. Connection Status Label (Top)
+    connection_label = lv_label_create(bg);
     lv_obj_align(connection_label, LV_ALIGN_TOP_MID, 0, 5);
-    // As a slave, we just wait for the master to contact us.
-    updateConnectionStatus("Waiting for Teensy...", 0xFFFF00); // Yellow
+    updateConnectionStatus("Waiting...", lv_color_hex(0xFFFF00)); // Yellow
 
-    status_label = lv_label_create(lv_screen_active());
-    lv_label_set_text(status_label, "Awaiting data...");
-    lv_obj_set_style_text_color(status_label, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_set_width(status_label, screenWidth - 10);
-    lv_obj_align(status_label, LV_ALIGN_BOTTOM_LEFT, 5, -5);
-    lv_label_set_long_mode(status_label, LV_LABEL_LONG_WRAP);
-
-    // Path drawing object (a line)
-    path_obj = lv_line_create(lv_screen_active());
-    lv_obj_set_style_line_width(path_obj, 2, 0);
-    lv_obj_set_style_line_color(path_obj, lv_color_hex(0x00FF00), 0); // Green path
-    lv_line_set_points(path_obj, path_points, 0); // Initially empty
-
-    // Toolhead object (a circle)
-    toolhead_obj = lv_obj_create(lv_screen_active());
-    lv_obj_set_size(toolhead_obj, 8, 8);
-    lv_obj_set_style_radius(toolhead_obj, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_bg_color(toolhead_obj, lv_color_hex(0xFF0000), 0); // Red toolhead
-    lv_obj_set_style_border_width(toolhead_obj, 0, 0);
-    lv_obj_center(toolhead_obj);
-    lv_obj_add_flag(toolhead_obj, LV_OBJ_FLAG_HIDDEN); // Hide until position is known
+    // 2. Main Text Label (for mirrored content)
+    main_text_label = lv_label_create(bg);
+    lv_obj_set_width(main_text_label, screenWidth - 20); // Add some padding
+    lv_label_set_long_mode(main_text_label, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(main_text_label, "Waiting for\nConnection...");
+    lv_obj_set_style_text_align(main_text_label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_align(main_text_label, LV_ALIGN_CENTER, 0, 0);
 
     Serial.println("HAL Setup complete. Waiting for master...");
 }
 
-// HAL Loop - Main application loop
 void hal_loop() {
-    // 1. Process all available serial data from the master
-    while (Serial1.available() > 0) {
-        char inChar = Serial1.read();
-        if (inChar == '\n') {
-            if (textBufferIndex > 0) {
-                textBuffer[textBufferIndex] = '\0';
-                processMessage(String(textBuffer));
-                textBufferIndex = 0;
-            }
-        } else if (inChar != '\r' && textBufferIndex < TEXT_BUFFER_SIZE - 1) {
-            textBuffer[textBufferIndex++] = inChar;
-        }
+    processIncomingUart();
+
+    if (isConnected && (millis() - lastPacketTime > CONNECTION_TIMEOUT)) {
+        isConnected = false;
+        updateConnectionStatus("Connection Lost!", lv_color_hex(0xFF0000)); // Red
+        lv_label_set_text(main_text_label, ""); // Clear the main text
+        Serial.println("Connection to Teensy lost (timeout).");
     }
 
-    // 2. Check for connection timeout
-    // If we haven't heard from the master, update status. Connection will be
-    // re-established on the next message received.
-    if (handshakeComplete && (millis() - lastPacketTime > CONNECTION_TIMEOUT)) {
-        updateConnectionStatus("Connection Lost!", 0xFF0000); // Red
-        handshakeComplete = false;
-        lv_obj_add_flag(toolhead_obj, LV_OBJ_FLAG_HIDDEN);
-    }
-
-    // 3. Handle LVGL tasks
     lv_timer_handler();
     delay(5);
 }
 
-// Process incoming text messages from the master
-void processMessage(const String& message) {
-    lastPacketTime = millis(); // We got a message, reset timeout timer
+// --- Core Communication Logic ---
 
-    if (message.length() < 1) return;
-    char command = message.charAt(0);
-    const char* payload = message.c_str() + 1;
-
-    // The first valid message from Teensy completes the "handshake"
-    if (!handshakeComplete) {
-        handshakeComplete = true;
-        updateConnectionStatus("Connected", 0x00FF00); // Green
+void processIncomingUart() {
+    while (Serial1.available()) {
+        uint8_t byte = Serial1.read();
+        switch (currentState) {
+            case ParseState::WAIT_FOR_START:
+                if (byte == START_BYTE) {
+                    calculatedChecksum = byte;
+                    currentState = ParseState::WAIT_FOR_TYPE;
+                }
+                break;
+            case ParseState::WAIT_FOR_TYPE:
+                receivedType = (PacketType)byte;
+                calculatedChecksum ^= byte;
+                currentState = ParseState::WAIT_FOR_LEN;
+                break;
+            case ParseState::WAIT_FOR_LEN:
+                payloadLength = byte;
+                calculatedChecksum ^= byte;
+                payloadIndex = 0;
+                currentState = (payloadLength == 0) ? ParseState::WAIT_FOR_CHECKSUM : ParseState::READ_PAYLOAD;
+                break;
+            case ParseState::READ_PAYLOAD:
+                payloadBuffer[payloadIndex++] = byte;
+                calculatedChecksum ^= byte;
+                if (payloadIndex == payloadLength) {
+                    currentState = ParseState::WAIT_FOR_CHECKSUM;
+                }
+                break;
+            case ParseState::WAIT_FOR_CHECKSUM:
+                if (byte == calculatedChecksum) {
+                    handlePacket(receivedType, payloadBuffer, payloadLength);
+                } else {
+                    Serial.println("Error: Checksum mismatch!");
+                }
+                currentState = ParseState::WAIT_FOR_START;
+                break;
+        }
     }
+}
 
-    switch (command) {
-        case 'S': // System message (like PING) from master
-            Serial.printf("System message: %s\n", payload);
-            sendResponse("ACK"); // Acknowledge the master
+void handlePacket(PacketType type, const uint8_t* payload, uint8_t len) {
+    lastPacketTime = millis();
+    if (!isConnected && type != PacketType::SYNC) return;
+
+    switch (type) {
+        case PacketType::SYNC:
+            if (!isConnected) {
+                isConnected = true;
+                Serial.println("Connection established with Teensy.");
+                updateConnectionStatus("Connected", lv_color_hex(0x00FF00)); // Green
+                lv_label_set_text(main_text_label, ""); // Clear waiting message
+            }
+            sendResponse(PacketType::SYNC_ACK);
             break;
-        case 'L': // Log message
-            handleLogMessage(payload);
-            sendResponse("ACK");
+        case PacketType::HEARTBEAT:
+            // Keep-alive received. No action or response needed.
             break;
-        case 'D': // Debug message
-            Serial.printf("Teensy Debug: %s\n", payload);
-            sendResponse("ACK");
+        case PacketType::CLEAR_SCREEN:
+            Serial.println("CMD: Clear Screen");
+            lv_label_set_text(main_text_label, "");
+            sendResponse(PacketType::ACK);
             break;
-        case 'T': // Path data
-            handlePathMessage(payload);
-            sendResponse("ACK");
-            break;
-        case 'P': // Position update
-            handlePositionMessage(payload);
-            sendResponse("ACK");
-            break;
-        case 'A': // Angle update
-            handleAngleMessage(payload);
-            sendResponse("ACK");
-            break;
-        case 'R': // Reset path
-            handleResetMessage();
-            sendResponse("ACK");
+        case PacketType::DRAW_TEXT:
+            Serial.println("CMD: Draw Text");
+            drawTextFromPacket(payload, len);
+            sendResponse(PacketType::ACK);
             break;
         default:
-            Serial.printf("Unknown command: %s\n", message.c_str());
-            sendResponse("NACK"); // Negative acknowledgment for unknown commands
+            Serial.printf("Warning: Unknown packet type received: 0x%02X\n", (uint8_t)type);
             break;
     }
 }
 
-void handleLogMessage(const char* payload) {
-    Serial.printf("Teensy Log: %s\n", payload);
-    if (status_label) {
-        lv_label_set_text(status_label, payload);
+void sendResponse(PacketType type) {
+    Serial1.write(START_BYTE);
+    Serial1.write((uint8_t)type);
+    Serial1.flush();
+}
+
+// --- Drawing Logic ---
+
+void drawTextFromPacket(const uint8_t* payload, uint8_t len) {
+    if (len < sizeof(DrawTextPayload)) {
+        Serial.println("Error: DRAW_TEXT payload is too short.");
+        return;
+    }
+    const DrawTextPayload* header = (const DrawTextPayload*)payload;
+    const char* text = (const char*)(payload + sizeof(DrawTextPayload));
+    size_t maxTextLen = len - sizeof(DrawTextPayload);
+    if (strnlen(text, maxTextLen) >= maxTextLen) {
+        Serial.println("Error: Received text payload is not null-terminated.");
+        return;
+    }
+
+    lv_label_set_text(main_text_label, text);
+    
+    // Map the textSize from Teensy (GFX style) to an appropriate LVGL font.
+    const lv_font_t *font;
+    switch (header->textSize) {
+        case 1:
+            font = &lv_font_montserrat_14;
+            break;
+        case 2:
+            font = &lv_font_montserrat_24;
+            break;
+        case 3:
+            font = &lv_font_montserrat_32;
+            break;
+        default:
+            font = &lv_font_montserrat_14; // Default to smallest size
+            break;
+    }
+    lv_obj_set_style_text_font(main_text_label, font, 0);
+
+
+    if (header->alignment == Alignment::CENTERED) {
+        lv_obj_set_style_text_align(main_text_label, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(main_text_label, LV_ALIGN_CENTER, 0, 0);
+    } else { // TOP_LEFT
+        lv_obj_set_style_text_align(main_text_label, LV_TEXT_ALIGN_LEFT, 0);
+        lv_obj_align(main_text_label, LV_ALIGN_TOP_LEFT, header->x, header->y);
     }
 }
 
-void handleResetMessage() {
-    Serial.println("Resetting path data.");
-    path_point_count = 0;
-    if (path_obj) {
-        lv_line_set_points(path_obj, path_points, 0);
-        lv_obj_invalidate(path_obj); // Force redraw
-    }
-    if(toolhead_obj){
-        lv_obj_add_flag(toolhead_obj, LV_OBJ_FLAG_HIDDEN);
-    }
-}
-
-void handlePathMessage(const char* payload) {
-    Serial.printf("Received path segment: %s\n", payload);
-    char* mutable_payload = strdup(payload);
-    if (!mutable_payload) return;
-    char* point_str = strtok(mutable_payload, ";");
-
-    while (point_str != NULL && path_point_count < MAX_PATH_POINTS) {
-        int x, y;
-        if (sscanf(point_str, "%d,%d", &x, &y) == 2) {
-            path_points[path_point_count].x = x;
-            path_points[path_point_count].y = y;
-            path_point_count++;
-        }
-        point_str = strtok(NULL, ";");
-    }
-    free(mutable_payload);
-
-    if (path_obj) {
-        lv_line_set_points(path_obj, path_points, path_point_count);
-    }
-    handleLogMessage("Path data updated.");
-}
-
-void handlePositionMessage(const char* payload) {
-    int x, y;
-    if (sscanf(payload, "%d,%d", &x, &y) == 2) {
-        if (toolhead_obj) {
-            lv_obj_clear_flag(toolhead_obj, LV_OBJ_FLAG_HIDDEN);
-            // Center the 8x8 circle on the given coordinates, relative to screen center
-            lv_obj_set_pos(toolhead_obj, x - 4 + (screenWidth / 2), y - 4 + (screenHeight / 2));
-        }
-    }
-}
-
-void handleAngleMessage(const char* payload) {
-    int angle;
-    if (sscanf(payload, "%d", &angle) == 1) {
-        if (toolhead_obj) {
-            // Placeholder for rotating an indicator if we add one
-        }
-    }
-}
-
-// Send simple newline-terminated responses back to the master
-void sendResponse(const char* message) {
-    if (!message) return;
-    Serial1.println(message);
-    Serial.printf("Sent ACK/NACK: %s\n", message);
-}
-
-void updateConnectionStatus(const char* status, uint32_t color) {
-    if (connection_label != nullptr) {
+void updateConnectionStatus(const char* status, lv_color_t color) {
+    if (connection_label) {
         lv_label_set_text(connection_label, status);
-        lv_obj_set_style_text_color(connection_label, lv_color_hex(color), 0);
+        lv_obj_set_style_text_color(connection_label, color, 0);
     }
     Serial.println(status);
 }
 
-// --- LVGL helper functions ---
+// --- LVGL Helper Functions ---
 
 static uint32_t my_tick(void) {
     return millis();
@@ -300,7 +302,6 @@ void my_disp_flush(lv_display_t *display, const lv_area_t *area, unsigned char *
     uint32_t w = lv_area_get_width(area);
     uint32_t h = lv_area_get_height(area);
     lv_draw_sw_rgb565_swap(data, w * h);
-
     if (tft.getStartCount() == 0) {
         tft.endWrite();
     }
@@ -315,3 +316,4 @@ static void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data) {
 void screenBrightness(uint8_t value) {
     tft.setBrightness(value);
 }
+
