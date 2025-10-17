@@ -35,7 +35,6 @@ constexpr uint8_t START_BYTE = 0xA5;
 enum class PacketType : uint8_t {
     // Teensy -> ESP32 Commands
     SYNC = 0x01,
-    HEARTBEAT = 0x05,
     CLEAR_SCREEN = 0x11,
     DRAW_TEXT = 0x12,
     // ESP32 -> Teensy Responses
@@ -60,8 +59,6 @@ struct DrawTextPayload {
 
 // --- State Management ---
 static bool isConnected = false;
-static unsigned long lastPacketTime = 0;
-const unsigned long CONNECTION_TIMEOUT = 5000; // 5 seconds
 
 // --- UART Packet Parsing State Machine ---
 enum class ParseState {
@@ -97,6 +94,7 @@ void hal_setup() {
 
     // Using Serial1 for Teensy communication
     Serial1.setPins(20, 21);
+    Serial1.setRxBufferSize(1024); // Add this line BEFORE begin()
     Serial1.begin(115200);
     Serial.println("Serial1 initialized on GPIO20 (RX) and GPIO21 (TX)");
 
@@ -145,63 +143,111 @@ void hal_setup() {
 }
 
 void hal_loop() {
+    static unsigned long lastPrint = 0;
+    static ParseState lastPrintedState = ParseState::WAIT_FOR_START;
+    
     processIncomingUart();
-
-    if (isConnected && (millis() - lastPacketTime > CONNECTION_TIMEOUT)) {
-        isConnected = false;
-        updateConnectionStatus("Connection Lost!", lv_color_hex(0xFF0000)); // Red
-        lv_label_set_text(main_text_label, ""); // Clear the main text
-        Serial.println("Connection to Teensy lost (timeout).");
+    lv_timer_handler();
+    
+    // Print state every second if it changes
+    if (millis() - lastPrint > 1000) {
+        if (currentState != lastPrintedState) {
+            Serial.printf("Current parser state: %d\n", (int)currentState);
+            lastPrintedState = currentState;
+        }
+        lastPrint = millis();
     }
 
-    lv_timer_handler();
-    delay(5);
 }
 
 // --- Core Communication Logic ---
 
 void processIncomingUart() {
+    static unsigned long lastByteTime = 0;
+
     while (Serial1.available()) {
         uint8_t byte = Serial1.read();
+        lastByteTime = millis();
+
         switch (currentState) {
             case ParseState::WAIT_FOR_START:
                 if (byte == START_BYTE) {
                     calculatedChecksum = byte;
                     currentState = ParseState::WAIT_FOR_TYPE;
+                    Serial.println("\n--- New Packet ---");
+                    Serial.printf("START: 0x%02X\n", byte);
                 }
                 break;
+                
             case ParseState::WAIT_FOR_TYPE:
                 receivedType = (PacketType)byte;
                 calculatedChecksum ^= byte;
                 currentState = ParseState::WAIT_FOR_LEN;
+                Serial.printf("TYPE:  0x%02X\n", byte);
                 break;
+                
             case ParseState::WAIT_FOR_LEN:
                 payloadLength = byte;
                 calculatedChecksum ^= byte;
                 payloadIndex = 0;
                 currentState = (payloadLength == 0) ? ParseState::WAIT_FOR_CHECKSUM : ParseState::READ_PAYLOAD;
-                break;
-            case ParseState::READ_PAYLOAD:
-                payloadBuffer[payloadIndex++] = byte;
-                calculatedChecksum ^= byte;
-                if (payloadIndex == payloadLength) {
-                    currentState = ParseState::WAIT_FOR_CHECKSUM;
+                Serial.printf("LEN:   %d\n", payloadLength);
+                if (payloadLength > 0) {
+                    Serial.print("PAYLOAD: ");
                 }
                 break;
+                
+            case ParseState::READ_PAYLOAD:
+                if (payloadIndex < sizeof(payloadBuffer)) {
+                    payloadBuffer[payloadIndex++] = byte;
+                    calculatedChecksum ^= byte;
+                    Serial.printf("0x%02X ", byte);
+                    
+                    if (payloadIndex == payloadLength) {
+                        Serial.println(); // End payload line
+                        currentState = ParseState::WAIT_FOR_CHECKSUM;
+                    }
+                } else {
+                    Serial.println("\nERROR: Payload buffer overflow!");
+                    currentState = ParseState::WAIT_FOR_START;
+                    calculatedChecksum = 0;
+                }
+                break;
+                
             case ParseState::WAIT_FOR_CHECKSUM:
+                Serial.printf("CHKSUM: 0x%02X (expected 0x%02X)\n", byte, calculatedChecksum);
                 if (byte == calculatedChecksum) {
+                    Serial.printf("✓ Packet Valid: type=0x%02X len=%d\n", (uint8_t)receivedType, payloadLength);
+                    
+                    // Decode and print text if it's a DRAW_TEXT packet
+                    if (receivedType == PacketType::DRAW_TEXT && payloadLength >= sizeof(DrawTextPayload)) {
+                        const DrawTextPayload* header = (const DrawTextPayload*)payloadBuffer;
+                        const char* text = (const char*)(payloadBuffer + sizeof(DrawTextPayload));
+                        Serial.printf("  └─> Text: \"%s\" (size=%d, align=%d)\n", 
+                                     text, header->textSize, (int)header->alignment);
+                    }
+                    
                     handlePacket(receivedType, payloadBuffer, payloadLength);
                 } else {
-                    Serial.println("Error: Checksum mismatch!");
+                    Serial.printf("✗ Checksum Mismatch!\n");
                 }
                 currentState = ParseState::WAIT_FOR_START;
+                calculatedChecksum = 0;
                 break;
         }
+    }
+
+    // Timeout recovery: if we're stuck mid-packet for >50ms, reset
+    if (currentState != ParseState::WAIT_FOR_START &&
+        millis() - lastByteTime > 200) {
+        Serial.println("⚠ Parser timeout - resetting to WAIT_FOR_START");
+        currentState = ParseState::WAIT_FOR_START;
+        calculatedChecksum = 0;
     }
 }
 
 void handlePacket(PacketType type, const uint8_t* payload, uint8_t len) {
-    lastPacketTime = millis();
+    // Only require connection for non-SYNC packets
     if (!isConnected && type != PacketType::SYNC) return;
 
     switch (type) {
@@ -213,9 +259,6 @@ void handlePacket(PacketType type, const uint8_t* payload, uint8_t len) {
                 lv_label_set_text(main_text_label, ""); // Clear waiting message
             }
             sendResponse(PacketType::SYNC_ACK);
-            break;
-        case PacketType::HEARTBEAT:
-            // Keep-alive received. No action or response needed.
             break;
         case PacketType::CLEAR_SCREEN:
             Serial.println("CMD: Clear Screen");
@@ -234,28 +277,43 @@ void handlePacket(PacketType type, const uint8_t* payload, uint8_t len) {
 }
 
 void sendResponse(PacketType type) {
+    uint8_t len = 0;
+    uint8_t checksum = START_BYTE ^ (uint8_t)type ^ len;
     Serial1.write(START_BYTE);
     Serial1.write((uint8_t)type);
+    Serial1.write(len);
+    Serial1.write(checksum);
     Serial1.flush();
+    Serial.printf("TX response: type 0x%02X (full packet)\n", (uint8_t)type);  // Debug
 }
 
 // --- Drawing Logic ---
 
 void drawTextFromPacket(const uint8_t* payload, uint8_t len) {
+    Serial.printf("DEBUG: drawTextFromPacket - len: %d\n", len);
     if (len < sizeof(DrawTextPayload)) {
         Serial.println("Error: DRAW_TEXT payload is too short.");
         return;
     }
+
     const DrawTextPayload* header = (const DrawTextPayload*)payload;
     const char* text = (const char*)(payload + sizeof(DrawTextPayload));
     size_t maxTextLen = len - sizeof(DrawTextPayload);
+
+    // Optional: Hex dump the received string data
+    Serial.print("Text payload (hex): ");
+    for(size_t i = 0; i < maxTextLen; ++i) {
+        Serial.printf("%02X ", text[i]);
+    }
+    Serial.println();
+
     if (strnlen(text, maxTextLen) >= maxTextLen) {
         Serial.println("Error: Received text payload is not null-terminated.");
         return;
     }
 
     lv_label_set_text(main_text_label, text);
-    
+
     // Map the textSize from Teensy (GFX style) to an appropriate LVGL font.
     const lv_font_t *font;
     switch (header->textSize) {
@@ -269,16 +327,15 @@ void drawTextFromPacket(const uint8_t* payload, uint8_t len) {
             font = &lv_font_montserrat_32;
             break;
         default:
-            font = &lv_font_montserrat_14; // Default to smallest size
+            font = &lv_font_montserrat_14;
             break;
     }
     lv_obj_set_style_text_font(main_text_label, font, 0);
 
-
     if (header->alignment == Alignment::CENTERED) {
         lv_obj_set_style_text_align(main_text_label, LV_TEXT_ALIGN_CENTER, 0);
         lv_obj_align(main_text_label, LV_ALIGN_CENTER, 0, 0);
-    } else { // TOP_LEFT
+    } else {
         lv_obj_set_style_text_align(main_text_label, LV_TEXT_ALIGN_LEFT, 0);
         lv_obj_align(main_text_label, LV_ALIGN_TOP_LEFT, header->x, header->y);
     }
@@ -316,4 +373,3 @@ static void my_touchpad_read(lv_indev_t *indev_driver, lv_indev_data_t *data) {
 void screenBrightness(uint8_t value) {
     tft.setBrightness(value);
 }
-
